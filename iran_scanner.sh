@@ -21,6 +21,14 @@ MIN_PREFIX=28
 VERBOSE=false
 PROVIDER=""
 PROBES="icmp,tcp,https"
+RESUME_FILE=""
+
+# Tool detection (optional accelerators)
+HAS_FPING=false; command -v fping &>/dev/null && HAS_FPING=true
+HAS_NMAP=false; command -v nmap &>/dev/null && HAS_NMAP=true
+HAS_MASSCAN=false; command -v masscan &>/dev/null && HAS_MASSCAN=true
+ICMP_DONE=false
+TCP_DONE=false
 
 log() { [[ "$VERBOSE" == "true" ]] && echo "[DEBUG] $*" >&2 || true; }
 
@@ -44,6 +52,7 @@ Options:
   --output-dir <dir>  Output directory (default: scans/)
   --probes <list>     Comma-separated probe types (default: icmp,tcp,https)
                       e.g. --probes icmp (ping only), --probes icmp,tcp
+  --resume <path>     Resume an interrupted scan (path to previous .csv)
   --min-prefix <N>    Skip CIDRs smaller than /N (default: 28)
   -v, --verbose       Show detailed probe logs for each IP
   -h, --help          Show this help
@@ -65,6 +74,7 @@ Examples:
   iran_scanner.sh --file samples/all_cidrs.txt --format cidrs
   iran_scanner.sh --file samples/all_cidrs.txt --probes icmp          # ping only
   iran_scanner.sh --file samples/aws_ip_ranges.json --probes icmp,tcp # no HTTPS
+  iran_scanner.sh --file samples/azure_servicetags.json --resume scans/scan_20260311.csv  # resume
 EOF
     exit 0
 }
@@ -82,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --min-prefix) MIN_PREFIX="$2"; shift 2 ;;
         --probes)     PROBES="$2"; shift 2 ;;
+        --resume)     RESUME_FILE="$2"; shift 2 ;;
         -v|--verbose) VERBOSE=true; shift ;;
         -h|--help)    usage ;;
         *)            echo "Unknown option: $1"; usage ;;
@@ -144,6 +155,9 @@ cleanup() {
     done
 
     echo "done." >&2
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        echo "  Resume with: $0 --resume $OUTPUT_FILE --file <input>" >&2
+    fi
     exit 0
 }
 trap cleanup INT TERM
@@ -326,40 +340,64 @@ cidr_to_24() {
 }
 
 # --- Probe function ---
+# Uses pre-computed bulk results (fping/nmap/masscan) when available,
+# falls back to individual probes when not.
 probe_ip() {
     local ip="$1" cidr="$2" results=""
 
     [[ "$VERBOSE" == "true" ]] && echo "[DEBUG] Probing $ip ($cidr)..." >&2
 
-    # ICMP ping (only if enabled)
+    # ICMP
     if [[ ",$PROBES," == *",icmp,"* ]]; then
-        if ping -c1 -W2 "$ip" &>/dev/null; then
-            results="${results}icmp,"
-            [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP OK" >&2
+        if [[ "$ICMP_DONE" == "true" ]]; then
+            # Use pre-computed fping results
+            if grep -qFx "$ip" "$STATS_DIR/fping_alive" 2>/dev/null; then
+                results="${results}icmp,"
+                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP OK (fping)" >&2
+            else
+                echo 1 >> "$STATS_DIR/fail_icmp"
+                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP failed (fping)" >&2
+            fi
         else
-            echo 1 >> "$STATS_DIR/fail_icmp"
-            [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP failed" >&2
+            if ping -c1 -W2 "$ip" &>/dev/null; then
+                results="${results}icmp,"
+                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP OK" >&2
+            else
+                echo 1 >> "$STATS_DIR/fail_icmp"
+                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: ICMP failed" >&2
+            fi
         fi
     fi
 
-    # TCP port probes (only if enabled)
+    # TCP
     if [[ ",$PROBES," == *",tcp,"* ]]; then
         IFS=',' read -ra port_list <<< "$PORTS"
         for port in "${port_list[@]}"; do
-            if (echo >/dev/tcp/"$ip"/"$port") 2>/dev/null; then
-                results="${results}tcp${port},"
-                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port OK" >&2
-            elif command -v nc &>/dev/null && nc -z -w3 "$ip" "$port" 2>/dev/null; then
-                results="${results}tcp${port},"
-                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port OK (nc)" >&2
+            if [[ "$TCP_DONE" == "true" ]]; then
+                # Use pre-computed nmap/masscan results
+                if grep -qFx "${ip}:${port}" "$STATS_DIR/tcp_open" 2>/dev/null; then
+                    results="${results}tcp${port},"
+                    [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port OK (bulk)" >&2
+                else
+                    echo 1 >> "$STATS_DIR/fail_tcp_${port}"
+                    [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port failed (bulk)" >&2
+                fi
             else
-                echo 1 >> "$STATS_DIR/fail_tcp_${port}"
-                [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port failed" >&2
+                if (echo >/dev/tcp/"$ip"/"$port") 2>/dev/null; then
+                    results="${results}tcp${port},"
+                    [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port OK" >&2
+                elif command -v nc &>/dev/null && nc -z -w3 "$ip" "$port" 2>/dev/null; then
+                    results="${results}tcp${port},"
+                    [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port OK (nc)" >&2
+                else
+                    echo 1 >> "$STATS_DIR/fail_tcp_${port}"
+                    [[ "$VERBOSE" == "true" ]] && echo "[DEBUG]   $ip: TCP/$port failed" >&2
+                fi
             fi
         done
     fi
 
-    # HTTPS probe (only if enabled and port 443 in list)
+    # HTTPS (always per-IP, no bulk tool)
     if [[ ",$PROBES," == *",https,"* ]] && [[ "$PORTS" == *"443"* ]]; then
         if curl -sk --connect-timeout 3 --max-time 5 "https://$ip/" -o /dev/null 2>/dev/null; then
             results="${results}https,"
@@ -379,7 +417,7 @@ probe_ip() {
 }
 
 export -f probe_ip ip_to_int int_to_ip cidr_sample_ip log
-export PORTS VERBOSE PROBES
+export PORTS VERBOSE PROBES ICMP_DONE TCP_DONE
 
 # --- Main ---
 main() {
@@ -452,9 +490,6 @@ main() {
     fi
 
     echo "Found $total unique IP blocks to scan"
-    echo "Scanning with $MAX_PARALLEL parallel probes..."
-    echo "Output: $OUTPUT_FILE"
-    echo ""
 
     # Stats directory
     local stats_dir
@@ -470,68 +505,196 @@ main() {
     IFS=',' read -ra _ports <<< "$PORTS"
     for p in "${_ports[@]}"; do echo 0 > "$stats_dir/tcp_${p}"; done
     export STATS_DIR="$stats_dir"
+    export PROGRESS_FILE="$progress_file"
 
-    # CSV header
-    echo "cidr,ip,methods" > "$OUTPUT_FILE"
-
-    # --- Scan loop ---
-    local launched=0
-    local last_progress_time
-    last_progress_time=$(date +%s)
-
-    while read -r cidr; do
-        local sample_ip
-        sample_ip=$(cidr_sample_ip "$cidr")
-
-        # Launch probe in background
-        (
-            result=$(probe_ip "$sample_ip" "$cidr")
-            if [[ -n "$result" ]]; then
-                echo "$result" >> "$OUTPUT_FILE"
-
-                # Update counters
-                local methods="${result##*,}"
-                echo $(( $(cat "$STATS_DIR/found" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/found" 2>/dev/null
-                [[ "$methods" == *icmp* ]] && echo $(( $(cat "$STATS_DIR/icmp" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/icmp" 2>/dev/null
-                [[ "$methods" == *https* ]] && echo $(( $(cat "$STATS_DIR/https" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/https" 2>/dev/null
-                IFS=',' read -ra _sp <<< "$PORTS"
-                for p in "${_sp[@]}"; do
-                    [[ "$methods" == *"tcp${p}"* ]] && echo $(( $(cat "$STATS_DIR/tcp_${p}" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/tcp_${p}" 2>/dev/null
-                done
+    # --- Resume support ---
+    local progress_file="${OUTPUT_FILE%.csv}.progress"
+    if [[ -n "$RESUME_FILE" ]]; then
+        OUTPUT_FILE="$RESUME_FILE"
+        progress_file="${RESUME_FILE%.csv}.progress"
+        if [[ -f "$progress_file" ]]; then
+            local prev_done
+            prev_done=$(wc -l < "$progress_file" | tr -d ' ')
+            echo "Resuming scan: $prev_done CIDRs already scanned"
+            # Filter out already-scanned CIDRs
+            local filtered
+            filtered=$(mktemp /tmp/iran_scanner.XXXXXXXXXX)
+            register_temp "$filtered"
+            grep -vFxf "$progress_file" "$cidr_list" > "$filtered" || true
+            cp "$filtered" "$cidr_list"
+            total=$(wc -l < "$cidr_list" | tr -d ' ')
+            if [[ "$total" -eq 0 ]]; then
+                echo "All CIDRs already scanned. Nothing to resume."
+                echo "Results: $OUTPUT_FILE"
+                return
             fi
-            # Increment scanned counter
-            echo $(( $(cat "$STATS_DIR/scanned" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/scanned" 2>/dev/null
-        ) &
+            echo "Remaining: $total blocks to scan"
+        else
+            echo "WARNING: No progress file found at $progress_file, starting fresh"
+            echo "cidr,ip,methods" > "$OUTPUT_FILE"
+        fi
+    else
+        # Fresh scan: write CSV header
+        echo "cidr,ip,methods" > "$OUTPUT_FILE"
+        > "$progress_file"
+    fi
 
-        launched=$((launched + 1))
-        echo "$launched" > "$stats_dir/launched" 2>/dev/null
+    # --- Generate IP-to-CIDR mapping ---
+    local ip_map="$stats_dir/ip_map.tsv"
+    local ip_only="$stats_dir/ips.txt"
+    while read -r cidr; do
+        printf '%s\t%s\n' "$(cidr_sample_ip "$cidr")" "$cidr"
+    done < "$cidr_list" > "$ip_map"
+    cut -f1 "$ip_map" > "$ip_only"
 
-        # Throttle: wait if too many parallel jobs
-        while [[ $(jobs -rp | wc -l) -ge $MAX_PARALLEL ]]; do
-            # Print progress while waiting (time-based, every 2 seconds)
+    # --- Detect and display tools ---
+    local tools_used="bash"
+    $HAS_FPING && tools_used="${tools_used}+fping"
+    $HAS_NMAP && tools_used="${tools_used}+nmap"
+    $HAS_MASSCAN && [[ $EUID -eq 0 ]] && tools_used="${tools_used}+masscan"
+    echo "Tools: $tools_used"
+    echo "Scanning with $MAX_PARALLEL parallel probes..."
+    echo "Output: $OUTPUT_FILE"
+    echo ""
+
+    # --- Phase 1: Bulk ICMP with fping ---
+    if $HAS_FPING && [[ ",$PROBES," == *",icmp,"* ]]; then
+        echo "  fping: bulk ICMP sweep ($total IPs)..."
+        fping -a -q -r 1 -t 2000 < "$ip_only" > "$stats_dir/fping_alive" 2>/dev/null || true
+        local alive_count
+        alive_count=$(wc -l < "$stats_dir/fping_alive" | tr -d ' ')
+        echo "  fping: $alive_count/$total alive"
+        ICMP_DONE=true
+        export ICMP_DONE
+    fi
+
+    # --- Phase 2: Bulk TCP with nmap ---
+    if $HAS_NMAP && [[ ",$PROBES," == *",tcp,"* ]]; then
+        local nmap_ports
+        nmap_ports=$(echo "$PORTS" | tr ',' ',')
+        echo -n "  nmap: TCP scan (ports: $nmap_ports, $total hosts)..."
+        # Fast flags: no retries, short timeout, min 300 pkt/s
+        nmap -sT -Pn --open -T4 --max-retries 0 --host-timeout 5s --min-rate 300 \
+            -p "$nmap_ports" -iL "$ip_only" \
+            -oG "$stats_dir/nmap_out.gnmap" >/dev/null 2>&1 &
+        local nmap_pid=$!
+        # Show spinner while nmap runs
+        while kill -0 "$nmap_pid" 2>/dev/null; do
+            printf "." >&2
+            sleep 3
+        done
+        wait "$nmap_pid" 2>/dev/null || true
+        echo "" >&2
+        # Parse grepable output → ip:port lines
+        grep "Ports:" "$stats_dir/nmap_out.gnmap" 2>/dev/null \
+            | while IFS= read -r line; do
+                local nip
+                nip=$(echo "$line" | awk '{print $2}')
+                echo "$line" | grep -oE '[0-9]+/open' | while read -r match; do
+                    echo "${nip}:${match%%/*}"
+                done
+            done > "$stats_dir/tcp_open" 2>/dev/null || true
+        local open_count
+        open_count=$(wc -l < "$stats_dir/tcp_open" 2>/dev/null | tr -d ' ')
+        echo "  nmap: $open_count open port(s) found"
+        TCP_DONE=true
+        export TCP_DONE
+    fi
+
+    # --- Phase 2b: Bulk TCP with masscan (fallback, needs root) ---
+    if ! $TCP_DONE && $HAS_MASSCAN && [[ ",$PROBES," == *",tcp,"* ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            echo "  masscan: TCP scan (ports: $PORTS, $total hosts)..."
+            masscan -iL "$ip_only" -p "$PORTS" --rate 1000 \
+                -oL "$stats_dir/masscan_out.txt" 2>/dev/null || true
+            # Parse: "open tcp PORT IP TIMESTAMP" → "IP:PORT"
+            grep "^open" "$stats_dir/masscan_out.txt" 2>/dev/null \
+                | awk '{print $4":"$3}' > "$stats_dir/tcp_open" 2>/dev/null || true
+            local open_count
+            open_count=$(wc -l < "$stats_dir/tcp_open" 2>/dev/null | tr -d ' ')
+            echo "  masscan: $open_count open port(s) found"
+            TCP_DONE=true
+            export TCP_DONE
+        else
+            log "masscan available but requires root, skipping"
+        fi
+    fi
+
+    # --- Decide: fast compile vs per-IP loop ---
+    local need_per_ip=false
+    if [[ ",$PROBES," == *",https,"* ]]; then
+        need_per_ip=true
+    fi
+    if [[ ",$PROBES," == *",icmp,"* ]] && ! $ICMP_DONE; then
+        need_per_ip=true
+    fi
+    if [[ ",$PROBES," == *",tcp,"* ]] && ! $TCP_DONE; then
+        need_per_ip=true
+    fi
+
+    if $need_per_ip; then
+        # --- Per-IP scan loop (with fast lookups for bulk-completed probes) ---
+        local launched=0
+        local last_progress_time
+        last_progress_time=$(date +%s)
+
+        while read -r cidr; do
+            local sample_ip
+            sample_ip=$(cidr_sample_ip "$cidr")
+
+            # Launch probe in background
+            (
+                result=$(probe_ip "$sample_ip" "$cidr")
+                if [[ -n "$result" ]]; then
+                    echo "$result" >> "$OUTPUT_FILE"
+
+                    # Update counters
+                    local methods="${result##*,}"
+                    echo $(( $(cat "$STATS_DIR/found" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/found" 2>/dev/null
+                    [[ "$methods" == *icmp* ]] && echo $(( $(cat "$STATS_DIR/icmp" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/icmp" 2>/dev/null
+                    [[ "$methods" == *https* ]] && echo $(( $(cat "$STATS_DIR/https" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/https" 2>/dev/null
+                    IFS=',' read -ra _sp <<< "$PORTS"
+                    for p in "${_sp[@]}"; do
+                        [[ "$methods" == *"tcp${p}"* ]] && echo $(( $(cat "$STATS_DIR/tcp_${p}" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/tcp_${p}" 2>/dev/null
+                    done
+                fi
+                # Increment scanned counter + track progress for resume
+                echo $(( $(cat "$STATS_DIR/scanned" 2>/dev/null || echo 0) + 1 )) > "$STATS_DIR/scanned" 2>/dev/null
+                echo "$cidr" >> "$PROGRESS_FILE" 2>/dev/null
+            ) &
+
+            launched=$((launched + 1))
+            echo "$launched" > "$stats_dir/launched" 2>/dev/null
+
+            # Throttle: wait if too many parallel jobs
+            while [[ $(jobs -rp | wc -l) -ge $MAX_PARALLEL ]]; do
+                local now
+                now=$(date +%s)
+                if (( now - last_progress_time >= 2 )); then
+                    _print_progress "$total" "$stats_dir"
+                    last_progress_time=$now
+                fi
+                sleep 0.2
+            done
+
             local now
             now=$(date +%s)
             if (( now - last_progress_time >= 2 )); then
                 _print_progress "$total" "$stats_dir"
                 last_progress_time=$now
             fi
-            sleep 0.2
-        done
 
-        # Also print progress every N launches
-        local now
-        now=$(date +%s)
-        if (( now - last_progress_time >= 2 )); then
-            _print_progress "$total" "$stats_dir"
-            last_progress_time=$now
-        fi
+        done < "$cidr_list"
 
-    done < "$cidr_list"
-
-    # Wait for all remaining jobs
-    echo "" >&2
-    echo "Waiting for remaining probes to finish..." >&2
-    wait 2>/dev/null
+        # Wait for all remaining jobs
+        echo "" >&2
+        echo "Waiting for remaining probes to finish..." >&2
+        wait 2>/dev/null
+    else
+        # --- Fast path: compile results directly from bulk scans (no subshells) ---
+        echo "  All probes completed by bulk tools, compiling results..."
+        _compile_bulk_results "$ip_map" "$stats_dir"
+    fi
 
     # Final stats
     _print_progress "$total" "$stats_dir"
@@ -579,6 +742,59 @@ main() {
     echo ""
     echo "  Results:        $OUTPUT_FILE"
     echo "========================================"
+}
+
+_compile_bulk_results() {
+    # Fast path: compile CSV from pre-computed fping/nmap/masscan results (no subshells)
+    local ip_map="$1" stats_dir="$2"
+    local count=0 found=0
+    local total_lines
+    total_lines=$(wc -l < "$ip_map" | tr -d ' ')
+
+    while IFS=$'\t' read -r ip cidr; do
+        local methods=""
+
+        # Check fping results
+        if $ICMP_DONE; then
+            if grep -qFx "$ip" "$stats_dir/fping_alive" 2>/dev/null; then
+                methods="${methods}icmp,"
+                echo $(( $(cat "$stats_dir/icmp" 2>/dev/null || echo 0) + 1 )) > "$stats_dir/icmp"
+            else
+                echo 1 >> "$stats_dir/fail_icmp"
+            fi
+        fi
+
+        # Check nmap/masscan results
+        if $TCP_DONE; then
+            IFS=',' read -ra _cp <<< "$PORTS"
+            for port in "${_cp[@]}"; do
+                if grep -qFx "${ip}:${port}" "$stats_dir/tcp_open" 2>/dev/null; then
+                    methods="${methods}tcp${port},"
+                    echo $(( $(cat "$stats_dir/tcp_${port}" 2>/dev/null || echo 0) + 1 )) > "$stats_dir/tcp_${port}"
+                else
+                    echo 1 >> "$stats_dir/fail_tcp_${port}"
+                fi
+            done
+        fi
+
+        methods="${methods%,}"
+        if [[ -n "$methods" ]]; then
+            echo "${cidr},${ip},${methods}" >> "$OUTPUT_FILE"
+            found=$((found + 1))
+        fi
+
+        count=$((count + 1))
+        echo "$count" > "$stats_dir/scanned"
+        echo "$found" > "$stats_dir/found"
+        echo "$count" > "$stats_dir/launched"
+        echo "$cidr" >> "$PROGRESS_FILE" 2>/dev/null
+
+        # Progress every 200 entries
+        if (( count % 200 == 0 )); then
+            printf "\r  Compiling: %d/%d\033[K" "$count" "$total_lines" >&2
+        fi
+    done < "$ip_map"
+    printf "\r  Compiling: %d/%d done\033[K\n" "$total_lines" "$total_lines" >&2
 }
 
 _count_lines() {

@@ -70,6 +70,7 @@ Options:
   --parallel <N>      Max concurrent probes (default: 50)
   --ports <list>      Comma-separated ports to test (default: 443,80,22)
   --probes <list>     Probe types to run: icmp,tcp,https (default: all three)
+  --resume <path>     Resume an interrupted scan (path to previous .csv)
   --output <path>     Output CSV file path (default: scans/scan_TIMESTAMP.csv)
   --output-dir <dir>  Output directory (default: scans/)
   --min-prefix <N>    Skip CIDRs smaller than /N (default: 28)
@@ -116,6 +117,9 @@ Options:
 
 # Ping + TCP only (skip HTTPS)
 ./iran_scanner.sh --file samples/aws_ip_ranges.json --probes icmp,tcp
+
+# Resume an interrupted scan (picks up where it left off)
+./iran_scanner.sh --file samples/azure_servicetags.json --resume scans/scan_20260311.csv
 ```
 
 > **Tip: Two-pass scanning** — The fastest strategy for large range files (e.g. all Azure or `all_cidrs.txt`) is two passes:
@@ -132,6 +136,18 @@ Options:
 
 **Minimal dependencies**: `bash`, `curl`, `ping`. Uses `jq` if available, falls back to `grep`.
 
+**Optional accelerators**: Install any of these for dramatically faster scans:
+
+| Tool | What it accelerates | Speedup | Install |
+|---|---|---|---|
+| `fping` | ICMP sweep — bulk pings all IPs in one process | 50-100x | `apt install fping` / `brew install fping` |
+| `nmap` | TCP port scan — parallel SYN/connect scanning | 5-10x | `apt install nmap` / `brew install nmap` |
+| `masscan` | TCP port scan — async, very fast (needs root) | 10-50x | `apt install masscan` / `brew install masscan` |
+
+Tools are auto-detected at startup. If available, they run as a bulk pre-scan phase before per-IP probes. If not installed, the scanner falls back to built-in bash probes — no functionality is lost.
+
+When all enabled probes have bulk tools available (e.g. `--probes icmp` with `fping` installed), the scanner skips the per-IP loop entirely and compiles results directly from the bulk output — finishing in seconds instead of minutes.
+
 **Offline mode**: Have someone outside Iran run `download_ranges.sh` and send the files, then:
 ```bash
 ./iran_scanner.sh --file samples/all_cidrs.txt
@@ -143,6 +159,20 @@ cidr,ip,methods
 102.37.128.0/17,102.37.128.1,"tcp443,tcp22,https"
 34.64.0.0/11,34.64.0.1,"tcp443,https"
 ```
+
+A `.progress` file is written alongside each CSV, tracking every CIDR attempted (not just accessible ones). This enables resuming interrupted scans.
+
+**Resuming interrupted scans**: If a scan is interrupted (Ctrl+C, network drop, etc.), resume it:
+```bash
+# The scanner tells you the exact command on Ctrl+C:
+#   "Resume with: ./iran_scanner.sh --resume scans/scan_20260311_025400.csv --file <input>"
+
+./iran_scanner.sh --file samples/azure_servicetags.json --resume scans/scan_20260311_025400.csv
+# Resuming scan: 2400 CIDRs already scanned
+# Remaining: 5333 blocks to scan
+```
+
+The `--resume` flag reads the `.progress` file to skip already-scanned CIDRs and appends new results to the existing CSV. All other flags (e.g. `--probes`, `--parallel`, `--region`) work normally alongside `--resume`.
 
 ### `cloud_setup.sh`
 
@@ -265,6 +295,7 @@ For manual download or reference:
 - **bash** 4.0+
 - **curl**
 - **jq** (recommended, not required for iran_scanner.sh)
+- **fping**, **nmap**, **masscan** (optional — auto-detected, dramatically faster scans)
 - Cloud provider CLI installed and authenticated for the provider you choose
 - SSH key pair (`ssh-keygen -t ed25519` if you don't have one)
 
