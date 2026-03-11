@@ -17,9 +17,12 @@ SSH_KEY="${HOME}/.ssh/id_rsa.pub"
 MAX_ATTEMPTS=500
 SERVICE_TAGS_FILE=""
 
+VERBOSE=false
 TEMP_IP_NAMES=()
 FOUND_IP=""
 FOUND_IP_NAME=""
+
+log() { [[ "$VERBOSE" == "true" ]] && echo "[DEBUG] $*" >&2 || true; }
 
 usage() {
     cat <<'EOF'
@@ -37,6 +40,7 @@ Options:
   --ssh-key <path>      SSH public key path (default: ~/.ssh/id_rsa.pub)
   --max-attempts <N>    Max IP allocation attempts (default: 500)
   --tags-file <path>    Local ServiceTags JSON for region detection
+  -v, --verbose         Show detailed logs (full az CLI output)
   -h, --help            Show this help
 
 Examples:
@@ -61,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --ssh-key)      SSH_KEY="$2"; shift 2 ;;
         --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
         --tags-file)    SERVICE_TAGS_FILE="$2"; shift 2 ;;
+        -v|--verbose)   VERBOSE=true; shift ;;
         -h|--help)      usage ;;
         *)              echo "Unknown option: $1"; usage ;;
     esac
@@ -85,6 +90,8 @@ if [[ ${#TARGET_CIDRS[@]} -eq 0 ]]; then
 fi
 
 echo "Target ranges: ${TARGET_CIDRS[*]}"
+log "Total target CIDRs: ${#TARGET_CIDRS[@]}"
+for _cidr in "${TARGET_CIDRS[@]}"; do log "  Target: $_cidr"; done
 
 # --- CIDR matching (pure bash) ---
 ip_to_int() {
@@ -186,6 +193,7 @@ while [[ $attempt -lt $MAX_ATTEMPTS ]] && [[ -z "$FOUND_IP" ]]; do
 
     echo -n "Attempt $attempt: "
 
+    log "Creating public IP: $ip_name in $LOCATION"
     output=$(az network public-ip create \
         --resource-group "$RG" \
         --name "$ip_name" \
@@ -194,6 +202,7 @@ while [[ $attempt -lt $MAX_ATTEMPTS ]] && [[ -z "$FOUND_IP" ]]; do
         --allocation-method Static 2>&1)
 
     if [[ $? -ne 0 ]]; then
+        log "az create failed. Full output:\n$output"
         if echo "$output" | grep -q "PublicIPCountLimitReached"; then
             echo "hit IP limit, waiting 15s..."
             sleep 15
@@ -204,6 +213,8 @@ while [[ $attempt -lt $MAX_ATTEMPTS ]] && [[ -z "$FOUND_IP" ]]; do
         continue
     fi
 
+    log "IP resource created: $ip_name"
+    [[ "$VERBOSE" == "true" ]] && echo "$output" | head -5 >&2
     TEMP_IP_NAMES+=("$ip_name")
 
     addr=$(az network public-ip show \
@@ -213,15 +224,18 @@ while [[ $attempt -lt $MAX_ATTEMPTS ]] && [[ -z "$FOUND_IP" ]]; do
 
     if [[ -z "$addr" ]]; then
         echo "could not read IP"
+        log "az show returned empty for $ip_name"
         continue
     fi
 
+    log "Got IP address: $addr — checking against ${#TARGET_CIDRS[@]} target range(s)"
     if ip_matches_any "$addr"; then
         FOUND_IP="$addr"
         FOUND_IP_NAME="$ip_name"
         echo -e "\n  [MATCH] $addr — keeping as $ip_name"
     else
         echo "$addr — not in range, deleting..."
+        log "Deleting non-matching IP: $ip_name ($addr)"
         az network public-ip delete --resource-group "$RG" --name "$ip_name" 2>/dev/null
         # Remove from temp list since we waited for delete
         TEMP_IP_NAMES=("${TEMP_IP_NAMES[@]/$ip_name/}")
@@ -239,7 +253,9 @@ fi
 echo ""
 echo "Creating VM '$VM_NAME' with IP $FOUND_IP..."
 
+log "Starting VM creation pipeline for $VM_NAME"
 echo "  Creating NSG..."
+log "az network nsg create --name ${VM_NAME}-nsg --location $LOCATION"
 az network nsg create \
     --resource-group "$RG" \
     --name "${VM_NAME}-nsg" \
@@ -262,6 +278,7 @@ for port in "${MOAV_PORTS[@]}"; do
         --output none 2>/dev/null || true
     priority=$((priority + 10))
 done
+log "NSG rules created for ports: ${MOAV_PORTS[*]}"
 echo "  NSG created with ports: ${MOAV_PORTS[*]}"
 
 echo "  Creating VNET..."
@@ -286,6 +303,7 @@ az network nic create \
     --output none
 
 echo "  Creating VM (this may take a few minutes)..."
+log "az vm create --name $VM_NAME --size $VM_SIZE --image ubuntu-24.04 --nics ${VM_NAME}-nic"
 az vm create \
     --resource-group "$RG" \
     --name "$VM_NAME" \
@@ -309,6 +327,7 @@ for i in $(seq 1 30); do
         echo "SSH is ready!"
         break
     fi
+    log "SSH attempt $i failed, retrying in 10s..."
     echo "  Attempt $i/30 — waiting 10s..."
     sleep 10
 done
