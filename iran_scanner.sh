@@ -471,7 +471,7 @@ main() {
     cidr_list=$(mktemp /tmp/iran_scanner.XXXXXXXXXX)
     register_temp "$cidr_list"
 
-    extract_cidrs "$input_file" "$fmt" \
+    { extract_cidrs "$input_file" "$fmt" \
         | grep -v ':' \
         | while read -r cidr; do
             local mask="${cidr#*/}"
@@ -480,7 +480,7 @@ main() {
                 else cidr_to_24 "$cidr"; fi
             fi
         done \
-        | sort -u > "$cidr_list"
+        | sort -u > "$cidr_list"; } || true
 
     local total
     total=$(wc -l < "$cidr_list" | tr -d ' ')
